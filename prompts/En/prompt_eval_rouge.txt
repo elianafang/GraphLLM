@@ -1,0 +1,49 @@
+# -*- coding: utf-8 -*-
+# @Time    : 2025/01/02
+# @Author  : Yin Cai
+# @Project : MIRAGE
+# @File    : prompt_eval_rouge.txt
+# @Description: Reconstruct description by LLMs and evaluate with Rouge-L.
+
+<promptcontent>###</promptcontent>  
+"Mystery Murder" is a role-playing puzzle game that focuses on the advancement of the plot and the interaction between characters. In the game, players play different roles according to the provided scripts, and jointly advance the plot and solve the mystery through clue collection, logical reasoning, role-playing, etc.
+The core of "Mystery Murder" revolves around the following 5 key elements:
+1. Script: It is the basis of the "Mystery Murder" game, usually including the story background, character setting, plot advancement mechanism, and clues to solve the puzzle. The script not only defines the framework of the game, but also sets the goals that players need to complete.
+2. Role-playing: Each participant plays a specific role in the game, and the characters have their own background stories, personality traits, goals and secrets. Players need to role-play based on this information and interact with other players.
+3. Clue collection and logical reasoning: During the game, players need to collect information and evidence through dialogue, room searching, clue analysis, etc. Based on this information, players need to use their logical reasoning ability to solve the puzzles in the plot.
+4. Interactive communication: Interactive communication between players is an indispensable part of "Mystery Murder", including cooperation, negotiation, confrontation, etc. Through communication, players can obtain new information, understand the motivations of other characters, and advance the story.
+5. Ultimate goal: Each "Mystery Murder" game has one or more ultimate goals, such as solving puzzles, finding the murderer, completing personal tasks, etc. Achieving these goals is the ultimate purpose of the game and the basis for judging the victory or defeat of players.
+
+Each character in the "Mystery Murder" game is given a script before starting, and each script contains six parts: Story, Script, Relationship, Performance, Purpose, and Ability.
+1. Story generally contains the basic information of the character, such as name, gender, etc., as well as the background story of the character, such as the personal experience before the killing event in the script.
+2. Script usually contains the actions of the character in the script killing event.
+3. Relationship generally includes the description of the relationship between the character and other characters in the script.
+4. Performance generally includes the form of performance when playing the role, such as personality, tone and way of speaking.
+5. Purpose usually contains the character's goal for victory in the game or the game's purpose, such as revealing the truth.
+6. Ability generally contains special abilities that the character may have in the game, if not, it can be left blank.
+
+You are an experienced player of Mystery Murder games. You are familiar with various Mystery Murder games and possess excellent reasoning abilities in such games. Below is {name}'s performance during the game:
+
+Here is all the historical conversation content:  
+{history}
+
+Here are all the actions {name} took in the game:  
+{actions}
+
+Here is the list of people participating in the game:  
+{role_list}
+
+Now, based on the above historical information, please deduce step by step the content of the {script_part} part of the original script of the character {name} in this game.
+You should reply with your detailed reasoning process after "### THOUGHT: " and reply to the content of {script_part} after "### RESPONSE: ". You should not reply with any extra content.
+
+Here is an example of a reply:
+
+### THOUGHT: XXX  
+### RESPONSE: XXX
+
+Note:  
+1. Your output should be in English.
+2. Your {script_part} response should be described in the second person.
+3. You can only reply to the content of "{script_part}" in {name} script after "### # RESPONSE:", and cannot reply to the content of other parts of the script
+
+Your output:

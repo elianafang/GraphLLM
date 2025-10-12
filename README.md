@@ -37,6 +37,3 @@ kill -9 <pid>
    / \
  whn lfj
 ```
-
-
-
