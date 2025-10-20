@@ -23,6 +23,8 @@ class MOC(BaseEnv):
         self.prompt_belief = read_txt(Config.DataDir / script_name / 'self_prompts' / 'prompt_belief.txt')
 
     def converse_stage(self, logs):
+        self.stage = 'conversation'
+        self.mplus.update_stage(self.stage)
         while self.turns < Config.MaxTurnNum:
             # converse
             print('**********Turn {}**********'.format(self.turns + 1))
@@ -31,21 +33,24 @@ class MOC(BaseEnv):
                 for c in list(self.scripts.keys()):
                     if c != name:
                         characters.append(c)
+                model_name = Config.Culprit_Model if name in self.culprit else Config.Civilian_Model
+                history_context = self.history_introduction + self.history + self.mplus.render_context(
+                    role=name,
+                    template='prompt_converse',
+                    model=model_name
+                )
                 prompt_converse = self.prompt_converse_raw.format(
                     name=name,
                     description=background,
                     self_clues=self.role_parameter[name]['self_clues'],
-                    history=self.history_introduction+self.history,
+                    history=history_context,
                     last_action=self.role_parameter[name]['last_action'][-1],
                     characters=characters,
                 )
                 if logs is None:
                     while True:
                         try:
-                            if name in self.culprit:
-                                response = Api(Config.Culprit_Model).run_api(prompt_converse)
-                            else:
-                                response = Api(Config.Civilian_Model).run_api(prompt_converse)
+                            response = Api(model_name).run_api(prompt_converse)
                             history_converse = response.split('### RESPONSE:')[1].strip()
                             action = re.findall('【(.*?)】【', history_converse, re.DOTALL)[0]
                             item = re.findall('】【(.*?)】:', history_converse, re.DOTALL)[0]
@@ -74,10 +79,7 @@ class MOC(BaseEnv):
                     except:
                         while True:
                             try:
-                                if name in self.culprit:
-                                    response = Api(Config.Culprit_Model).run_api(prompt_converse)
-                                else:
-                                    response = Api(Config.Civilian_Model).run_api(prompt_converse)
+                                response = Api(model_name).run_api(prompt_converse)
                                 history_converse = response.split('### RESPONSE:')[1].strip()
                                 action = re.findall('【(.*?)】【', history_converse, re.DOTALL)[0]
                                 item = re.findall('】【(.*?)】：', history_converse, re.DOTALL)[0]
@@ -93,10 +95,7 @@ class MOC(BaseEnv):
                 if name in self.culprit and Config.force_expose:
                     ask_content = "I'm the Culprit. " + ask_content
                 self.save_log('Env', prompt_converse, template='prompt_converse')
-                if name in self.culprit:
-                    self.save_log(name, response, template='prompt_converse', model=Config.Culprit_Model)
-                else:
-                    self.save_log(name, response, template='prompt_converse', model=Config.Civilian_Model)
+                self.save_log(name, response, template='prompt_converse', model=model_name)
 
                 task_history = self.ask(item, name, background, self.history_introduction, self.history, ask_content, logs)
                 self.role_parameter[name]['last_action'].append(response + '\n' + name + '：' + task_history)
@@ -115,16 +114,19 @@ class MOC(BaseEnv):
     def self_query(self, history_introduction, history, other_name, candidates):
         # 怀疑度评估，怀疑度[0, 1, 2]
         history = self.token_check(history)
+        model_name = Config.Culprit_Model if other_name in self.culprit else Config.Civilian_Model
+        history_context = history_introduction + history + self.mplus.render_context(
+            role=other_name,
+            template='prompt_query',
+            model=model_name
+        )
         prompt_query = self.prompt_query.format(
-            history=history_introduction+history,
+            history=history_context,
             other_name=other_name,
         )
         while True:
             try:
-                if other_name in self.culprit:
-                    response = Api(Config.Culprit_Model).run_api(prompt_query)
-                else:
-                    response = Api(Config.Civilian_Model).run_api(prompt_query)
+                response = Api(model_name).run_api(prompt_query)
                 query_response = response.split('### RESPONSE:')[1].strip()
                 candidates[other_name]['query'] += int(query_response)
                 break
@@ -133,24 +135,25 @@ class MOC(BaseEnv):
         candidates[other_name]['query_all'] += 2
         candidates[other_name]['query_value'] += int(query_response)
         self.save_log('Env', prompt_query, template='prompt_query')
-        if other_name in self.culprit:
-            self.save_log('Agent', response, template='prompt_query', model=Config.Culprit_Model)
-        else:
-            self.save_log('Agent', response, template='prompt_query', model=Config.Civilian_Model)
+        self.save_log('Agent', response, template='prompt_query', model=model_name)
+        self.mplus.update_candidates(candidates)
 
     def self_belief(self, history_introduction, history, other_name, candidates):
         # 信任度评估，信任度[-2, -1, 0]
         history = self.token_check(history)
+        model_name = Config.Culprit_Model if other_name in self.culprit else Config.Civilian_Model
+        history_context = history_introduction + history + self.mplus.render_context(
+            role=other_name,
+            template='prompt_belief',
+            model=model_name
+        )
         prompt_belief = self.prompt_belief.format(
-            history=history_introduction+history,
+            history=history_context,
             other_name=other_name,
         )
         while True:
             try:
-                if other_name in self.culprit:
-                    response = Api(Config.Culprit_Model).run_api(prompt_belief)
-                else:
-                    response = Api(Config.Civilian_Model).run_api(prompt_belief)
+                response = Api(model_name).run_api(prompt_belief)
                 belief_response = response.split('### RESPONSE:')[1].strip()
                 candidates[other_name]['query'] -= int(belief_response)
                 break
@@ -159,29 +162,30 @@ class MOC(BaseEnv):
         candidates[other_name]['belief_all'] += 2
         candidates[other_name]['belief_value'] += int(belief_response)
         self.save_log('Env', prompt_belief, template='prompt_belief')
-        if other_name in self.culprit:
-            self.save_log('Agent', response, template='prompt_belief', model=Config.Culprit_Model)
-        else:
-            self.save_log('Agent', response, template='prompt_belief', model=Config.Civilian_Model)
+        self.save_log('Agent', response, template='prompt_belief', model=model_name)
+        self.mplus.update_candidates(candidates)
 
     def select(self, logs):
         for name, background in self.env_summary.items():
             while True:
+                model_name = Config.Culprit_Model if name in self.culprit else Config.Civilian_Model
+                history_context = self.history_introduction + self.history + self.mplus.render_context(
+                    role=name,
+                    template='prompt_select',
+                    model=model_name
+                )
                 prompt_select = self.prompt_select_raw.format(
                     name=name,
                     description=background,
                     self_clues=self.role_parameter[name]['self_clues'],
-                    history=self.history_introduction+self.history,
+                    history=history_context,
                     last_action=self.role_parameter[name]['last_action'][-1],
                     address=list(self.clues.keys())
                 )
                 if logs is None:
                     while True:
                         try:
-                            if name in self.culprit:
-                                response = Api(Config.Culprit_Model).run_api(prompt_select)
-                            else:
-                                response = Api(Config.Civilian_Model).run_api(prompt_select)
+                            response = Api(model_name).run_api(prompt_select)
                             history_converse = response.split('### RESPONSE:')[1].strip()
                             action = re.findall('【(.*?)】【', history_converse, re.DOTALL)[0]
                             item = re.findall('】【(.*?)】:', history_converse, re.DOTALL)[0]
@@ -212,10 +216,7 @@ class MOC(BaseEnv):
                     except:
                         while True:
                             try:
-                                if name in self.culprit:
-                                    response = Api(Config.Culprit_Model).run_api(prompt_select)
-                                else:
-                                    response = Api(Config.Civilian_Model).run_api(prompt_select)
+                                response = Api(model_name).run_api(prompt_select)
                                 history_converse = response.split('### RESPONSE:')[1].strip()
                                 action = re.findall('【(.*?)】【', history_converse, re.DOTALL)[0]
                                 item = re.findall('】【(.*?)】:', history_converse, re.DOTALL)[0]
@@ -235,10 +236,7 @@ class MOC(BaseEnv):
             if name in self.culprit and Config.force_expose:
                 ask_content = "I'm the Culprit. " + ask_content
             self.save_log('Env', prompt_select, template='prompt_converse')
-            if name in self.culprit:
-                self.save_log(name, response, template='prompt_converse', model=Config.Culprit_Model)
-            else:
-                self.save_log(name, response, template='prompt_converse', model=Config.Civilian_Model)
+            self.save_log(name, response, template='prompt_converse', model=model_name)
 
             logs = self.del_logs_with_template(logs, template='prompt_history_summarize')
             logs = self.del_logs_with_template(logs, template='clue')
@@ -350,4 +348,5 @@ class MOC(BaseEnv):
         self.save_result()
         self.save_config()
         self.logger.close()
+        self.mplus.close()
         print("******************************Finish******************************")

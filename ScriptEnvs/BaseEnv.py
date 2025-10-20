@@ -6,6 +6,7 @@ from data_loader import *
 from utils import Api
 from utils import Config
 from logger import Logger
+from mplus_runtime import MiragePlusRuntime
 from pathlib import Path
 import copy, random
 
@@ -39,9 +40,12 @@ class BaseEnv:
         # Base config
         self.words_num = Config.MaxBaseScriptSummaryToken
         self.logger = Logger(script_name)
+        self.mplus = MiragePlusRuntime(script_name, self.logger.log_dir, Config)
         self.debug = Config.DEBUG
         self.console = Config.Console
         self.turns = 0
+        self.stage = None
+        self._mplus_persons_registered = False
         self.script_name = script_name
         self.fail_num = 0
         self.clue_count = 0
@@ -64,6 +68,11 @@ class BaseEnv:
                 self.scripts = read_json(path)
             elif str(path).endswith('线索.json') or str(path).endswith('clues.json'):
                 self.clues = read_json(path)
+
+        if hasattr(self, 'scripts') and isinstance(self.scripts, dict):
+            self.mplus.bootstrap_from_scripts(self.scripts)
+        if hasattr(self, 'clues') and isinstance(self.clues, dict):
+            self.mplus.bootstrap_from_clues(self.clues)
 
         # Load prompts
         self.prompt_script_summarize_raw = read_txt(Config.PromptDir / 'prompt_script_summarize.txt')
@@ -129,21 +138,24 @@ class BaseEnv:
         return clue, clue_history
 
     def ask(self, item, name, background,history_introduction, history, ask_content, logs):
+        model_name = Config.Culprit_Model if item in self.culprit else Config.Civilian_Model
+        history_context = history_introduction + history + self.mplus.render_context(
+            role=item,
+            template='prompt_ask',
+            model=model_name
+        )
         prompt_ask = self.prompt_ask_raw.format(
             name=item,
             description=background,
             self_clues=self.role_parameter[name]['self_clues'],
-            history=history_introduction+history,
+            history=history_context,
             ask_name=name,
             ask_content=ask_content
         )
         if logs is None:
             while True:
                 try:
-                    if item in self.culprit:
-                        response = Api(Config.Culprit_Model).run_api(prompt_ask)
-                    else:
-                        response = Api(Config.Civilian_Model).run_api(prompt_ask)
+                    response = Api(model_name).run_api(prompt_ask)
                     ask_response = response.split('### RESPONSE:')[1].strip()
                     break
                 except:
@@ -156,26 +168,26 @@ class BaseEnv:
         if Config.force_expose and item in self.culprit:
             ask_response = "I'm the Culprit. " + ask_response
         self.save_log('Env', prompt_ask, template='prompt_ask')
-        if item in self.culprit:
-            self.save_log(item, response, template='prompt_ask', model=Config.Culprit_Model)
-        else:
-            self.save_log(item, response, template='prompt_ask', model=Config.Civilian_Model)
+        self.save_log(item, response, template='prompt_ask', model=model_name)
         return ask_response
 
     def query(self, history_introduction, history, other_name, content, candidates):
         # 怀疑度评估，怀疑度[0, 1, 2]
         history = self.token_check(history)
+        model_name = Config.Culprit_Model if other_name in self.culprit else Config.Civilian_Model
+        history_context = history_introduction + history + self.mplus.render_context(
+            role=other_name,
+            template='prompt_query',
+            model=model_name
+        )
         prompt_query = self.prompt_query.format(
-            history=history_introduction+history,
+            history=history_context,
             other_name=other_name,
             content=content
         )
         while True:
             try:
-                if other_name in self.culprit:
-                    response = Api(Config.Culprit_Model).run_api(prompt_query)
-                else:
-                    response = Api(Config.Civilian_Model).run_api(prompt_query)
+                response = Api(model_name).run_api(prompt_query)
                 query_response = response.split('### RESPONSE:')[1].strip()
                 candidates[other_name]['query'] += int(query_response)
                 break
@@ -184,25 +196,26 @@ class BaseEnv:
         candidates[other_name]['query_all'] += 2
         candidates[other_name]['query_value'] += int(query_response)
         self.save_log('Env', prompt_query, template='prompt_query')
-        if other_name in self.culprit:
-            self.save_log('Agent', response, template='prompt_query', model=Config.Culprit_Model)
-        else:
-            self.save_log('Agent', response, template='prompt_query', model=Config.Civilian_Model)
+        self.save_log('Agent', response, template='prompt_query', model=model_name)
+        self.mplus.update_candidates(candidates)
 
     def belief(self, history_introduction, history, other_name, content, candidates):
         # 信任度评估，信任度[-2, -1, 0]
         history = self.token_check(history)
+        model_name = Config.Culprit_Model if other_name in self.culprit else Config.Civilian_Model
+        history_context = history_introduction + history + self.mplus.render_context(
+            role=other_name,
+            template='prompt_belief',
+            model=model_name
+        )
         prompt_belief = self.prompt_belief.format(
-            history=history_introduction+history,
+            history=history_context,
             other_name=other_name,
             content=content
         )
         while True:
             try:
-                if other_name in self.culprit:
-                    response = Api(Config.Culprit_Model).run_api(prompt_belief)
-                else:
-                    response = Api(Config.Civilian_Model).run_api(prompt_belief)
+                response = Api(model_name).run_api(prompt_belief)
                 belief_response = response.split('### RESPONSE:')[1].strip()
                 candidates[other_name]['query'] -= int(belief_response)
                 break
@@ -211,10 +224,8 @@ class BaseEnv:
         candidates[other_name]['belief_all'] += 2
         candidates[other_name]['belief_value'] += int(belief_response)
         self.save_log('Env', prompt_belief, template='prompt_belief')
-        if other_name in self.culprit:
-            self.save_log('Agent', response, template='prompt_belief', model=Config.Culprit_Model)
-        else:
-            self.save_log('Agent', response, template='prompt_belief', model=Config.Civilian_Model)
+        self.save_log('Agent', response, template='prompt_belief', model=model_name)
+        self.mplus.update_candidates(candidates)
 
     def script_summarize(self, name, content, logs):
         summarized_content = dict()
@@ -294,6 +305,8 @@ class BaseEnv:
         return summarized_content
 
     def init_stage(self, logs):
+        self.stage = 'init'
+        self.mplus.update_stage(self.stage)
         self.turns = 0
         for name, content in self.scripts.items():
             script_summary = self.script_format.format(
@@ -339,6 +352,8 @@ class BaseEnv:
             self.address[name] = list(self.clues.keys())
 
     def self_introduction_stage(self, logs):
+        self.stage = 'self_introduction'
+        self.mplus.update_stage(self.stage)
         for name, background in self.env_summary.items():
             prompt_introduction = self.prompt_introduction_raw.format(
                 name=name,
@@ -394,8 +409,13 @@ class BaseEnv:
             self.history_introduction += name + ':【Self-Introduction】: ' + introduction + '\n'
 
         self.history_introduction = self.token_check(self.history_introduction) + '\n'
+        if not self._mplus_persons_registered:
+            self.mplus.register_persons(list(self.scripts.keys()))
+            self._mplus_persons_registered = True
 
     def converse_stage(self, logs):
+        self.stage = 'conversation'
+        self.mplus.update_stage(self.stage)
         while self.turns < Config.MaxTurnNum:
             # converse
             print('**********Turn {}**********'.format(self.turns + 1))
@@ -407,11 +427,17 @@ class BaseEnv:
                         characters.append(c)
                 if name in self.address[name]:
                     ls_address.remove(name)
+                model_name = Config.Culprit_Model if name in self.culprit else Config.Civilian_Model
+                history_context = self.history_introduction + self.history + self.mplus.render_context(
+                    role=name,
+                    template='prompt_converse',
+                    model=model_name
+                )
                 prompt_converse = self.prompt_converse_raw.format(
                     name=name,
                     description=background,
                     self_clues=self.role_parameter[name]['self_clues'],
-                    history=self.history_introduction+self.history,
+                    history=history_context,
                     last_action=self.role_parameter[name]['last_action'][-1],
                     characters=characters,
                     address=ls_address
@@ -419,10 +445,7 @@ class BaseEnv:
                 if logs is None:
                     while True:
                         try:
-                            if name in self.culprit:
-                                response = Api(Config.Culprit_Model).run_api(prompt_converse)
-                            else:
-                                response = Api(Config.Civilian_Model).run_api(prompt_converse)
+                            response = Api(model_name).run_api(prompt_converse)
                             history_converse = response.split('### RESPONSE:')[1].strip()
                             action = re.findall('【(.*?)】【', history_converse, re.DOTALL)[0]
                             item = re.findall('】【(.*?)】:', history_converse, re.DOTALL)[0]
@@ -455,10 +478,7 @@ class BaseEnv:
                     except:
                         while True:
                             try:
-                                if name in self.culprit:
-                                    response = Api(Config.Culprit_Model).run_api(prompt_converse)
-                                else:
-                                    response = Api(Config.Civilian_Model).run_api(prompt_converse)
+                                response = Api(model_name).run_api(prompt_converse)
                                 history_converse = response.split('### RESPONSE:')[1].strip()
                                 action = re.findall('【(.*?)】【', history_converse, re.DOTALL)[0]
                                 item = re.findall('】【(.*?)】:', history_converse, re.DOTALL)[0]
@@ -476,10 +496,7 @@ class BaseEnv:
                 if Config.force_expose and name in self.culprit:
                     ask_content = "I'm the Culprit. " + ask_content
                 self.save_log('Env', prompt_converse, template='prompt_converse')
-                if name in self.culprit:
-                    self.save_log(name, response, template='prompt_converse', model=Config.Culprit_Model)
-                else:
-                    self.save_log(name, response, template='prompt_converse', model=Config.Civilian_Model)
+                self.save_log(name, response, template='prompt_converse', model=model_name)
 
                 # query & belief Eval
                 logs = self.del_logs_with_template(logs, template='prompt_history_summarize')
@@ -518,20 +535,25 @@ class BaseEnv:
             self.turns += 1
 
     def vote_stage(self):
+        self.stage = 'vote'
+        self.mplus.update_stage(self.stage)
         for name, description in self.env_summary.items():
+            model_name = Config.Culprit_Model if name in self.culprit else Config.Civilian_Model
+            history_context = self.history_introduction + self.history + self.mplus.render_context(
+                role=name,
+                template='prompt_vote',
+                model=model_name
+            )
             prompt_vote = self.prompt_vote.format(
                 name=name,
                 description=description,
                 self_clues=self.role_parameter[name]['self_clues'],
-                history=self.history_introduction+self.history,
+                history=history_context,
                 role_list=str(list(self.candidates.keys())),
             )
             while True:
                 try:
-                    if name in self.culprit:
-                        response = Api(Config.Culprit_Model).run_api(prompt_vote)
-                    else:
-                        response = Api(Config.Civilian_Model).run_api(prompt_vote)
+                    response = Api(model_name).run_api(prompt_vote)
                     vote_response = response.split('### RESPONSE:')[1].strip()
                     try:
                         self.candidates[vote_response]['query'] += len(self.env_summary.keys()) * 1
@@ -542,12 +564,11 @@ class BaseEnv:
                 except:
                     self.fail_num += 1
             self.save_log('Env', prompt_vote, template='prompt_vote')
-            if name in self.culprit:
-                self.save_log(name, response, template='prompt_vote', model=Config.Culprit_Model)
-            else:
-                self.save_log(name, response, template='prompt_vote', model=Config.Civilian_Model)
+            self.save_log(name, response, template='prompt_vote', model=model_name)
 
     def end_stage(self):
+        self.stage = 'end'
+        self.mplus.update_stage(self.stage)
         query = dict()
         for name, para in self.candidates.items():
             query[name] = para['query']
@@ -557,8 +578,11 @@ class BaseEnv:
         for tp in sorted_query:
             print('{}：{}'.format(tp[0], tp[1]))
             self.save_n_log('Env', '{}：{}'.format(tp[0], tp[1]))
-        print('\nVoted Culprit: {}。'.format(sorted_query[0][0]))
-        self.save_n_log('Env', 'Voted Culprit: {}。'.format(sorted_query[0][0]))
+        ranking = [tp[0] for tp in sorted_query]
+        voted = ranking[0] if ranking else None
+        print('\nVoted Culprit: {}。'.format(voted if voted else ''))
+        self.save_n_log('Env', 'Voted Culprit: {}。'.format(voted if voted else ''))
+        self.mplus.record_votes(ranking, voted, self.culprit)
 
         # fail num
         print('\nFailure Number of Parsing: {}'.format(self.fail_num))
@@ -614,9 +638,10 @@ class BaseEnv:
         self.save_result()
         self.save_config()
         self.logger.close()
+        self.mplus.close()
         print("******************************Finish******************************")
 
-    def save_log(self, user, text, template, model=Config.Base_Model):
+    def save_log(self, user, text, template, model=Config.Base_Model, mp_extras=None):
         if Config.Console:
             if user != 'Env' and 'query' not in template and 'clue' not in template and 'belief' not in template:
                 if 'eval' in template:
@@ -636,7 +661,24 @@ class BaseEnv:
             template=template,
             model=model,
             debug=self.debug,
-            console=self.console
+            console=self.console,
+            mp_extras=mp_extras
+        )
+        round_index = None
+        if self.stage == 'conversation':
+            round_index = self.turns + 1
+        elif self.stage == 'self_introduction':
+            round_index = 0
+        else:
+            round_index = self.turns
+        self.mplus.record_message(
+            user=user,
+            text=text,
+            template=template,
+            model=model,
+            stage=self.stage,
+            round_index=round_index,
+            mp_extras=mp_extras
         )
 
     def save_n_log(self, user, text):
@@ -647,9 +689,27 @@ class BaseEnv:
             debug=self.debug,
             console=self.console
         )
+        round_index = None
+        if self.stage == 'conversation':
+            round_index = self.turns + 1
+        elif self.stage == 'self_introduction':
+            round_index = 0
+        else:
+            round_index = self.turns
+        self.mplus.record_message(
+            user=user,
+            text=text,
+            template='nlog',
+            model=None,
+            stage=self.stage,
+            round_index=round_index,
+            mp_extras=None
+        )
 
     def llms_eval(self):
         print('LLMs Evaluation...')
+        self.stage = 'evaluation_llm'
+        self.mplus.update_stage(self.stage)
         ability = {
             'Zh': {
                 'rp': '角色扮演',
@@ -670,12 +730,17 @@ class BaseEnv:
             actions = ''
             for action in self.role_parameter[name]['last_action']:
                 actions += action + '\n'
+            history_context = self.history_introduction + self.history + self.mplus.render_context(
+                role=name,
+                template='prompt_eval',
+                model=Config.Eval_Model
+            )
             for _, ab in ability[Config.Language].items():
                 prompt_eval = self.prompt_eval.format(
                     name=name,
                     description=self.env_summary[name],
                     self_clues=self.role_parameter[name]['self_clues'],
-                    history=self.history_introduction+self.history,
+                    history=history_context,
                     actions=actions,
                     role_list=list(self.scripts.keys()),
                     truth=self.truth,
@@ -701,16 +766,23 @@ class BaseEnv:
 
     def rouge_eval(self):
         print('Rouge Evaluation...')
+        self.stage = 'evaluation_rouge'
+        self.mplus.update_stage(self.stage)
         for name, background in self.env_summary.items():
             actions = ''
             for action in self.role_parameter[name]['last_action']:
                 actions += action + '\n'
                 actions = self.token_check(actions)
+            history_context = self.history_introduction + self.history + self.mplus.render_context(
+                role=name,
+                template='prompt_eval_rouge',
+                model=Config.Eval_Model
+            )
             rouge_score = list()
             for script_part in self.scripts[name].keys():
                 prompt_eval_rouge = self.prompt_eval_rouge.format(
                     name=name,
-                    history=self.history_introduction + self.history,
+                    history=history_context,
                     actions=actions,
                     role_list=list(self.scripts.keys()),
                     script_part=script_part,
@@ -745,7 +817,7 @@ class BaseEnv:
         if Config.DEBUG:
             print(message)
         for k, v in self.__dict__.items():
-            if not isinstance(v, Logger):
+            if not isinstance(v, (Logger, MiragePlusRuntime)):
                 message[k] = v
         self.logger.messages.append(message)
         self.logger.log_fw.write(json.dumps(message, ensure_ascii=False, indent=1) + '\n')
@@ -791,3 +863,4 @@ class BaseEnv:
                 'fii': fii
             }
         }
+        self.mplus.record_evaluation(self.result)

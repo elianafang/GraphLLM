@@ -27,7 +27,17 @@ class Logger:
         self.messages.append(message)
         self.log_fw.write(json.dumps(message, ensure_ascii=False, indent=1)+'\n')
 
-    def gprint(self, script_name, user, text, template, model, debug=False, console=True):
+    def gprint(
+            self,
+            script_name,
+            user,
+            text,
+            template,
+            model,
+            debug=False,
+            console=True,
+            mp_extras=None
+    ):
         message = {
                 'Script_name': script_name,
                 'Name': user,
@@ -41,6 +51,8 @@ class Logger:
                 'ForceSummary': Config.force_summary,
                 'TimeTemp': time.strftime('%Y-%m-%d-%H-%M-%S', time.localtime(time.time()))
         }
+        if mp_extras:
+            message['MP_Extras'] = mp_extras
         if debug:
             print(message)
         self.messages.append(message)
