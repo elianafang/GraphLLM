@@ -68,4 +68,5 @@ class MUC(BaseEnv):
         self.save_result()
         self.save_config()
         self.logger.close()
+        self.mplus.close()
         print("******************************Finish******************************")
