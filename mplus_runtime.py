@@ -1562,4 +1562,3 @@ class MiragePlusRuntime:
         if match:
             hour = int(match.group(1)) % 24
             return hour * 60
-        return math.inf

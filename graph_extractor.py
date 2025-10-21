@@ -658,4 +658,3 @@ class GraphExtractor:
             if cleaned:
                 return cleaned[:120]
         return text[:120]
-
