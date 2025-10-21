@@ -351,6 +351,10 @@ class BaseEnv:
             }
             self.address[name] = list(self.clues.keys())
 
+        if not self._mplus_persons_registered:
+            self.mplus.register_persons(list(self.scripts.keys()))
+            self._mplus_persons_registered = True
+
     def self_introduction_stage(self, logs):
         self.stage = 'self_introduction'
         self.mplus.update_stage(self.stage)

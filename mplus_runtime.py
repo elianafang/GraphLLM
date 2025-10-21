@@ -10,16 +10,19 @@ from graph_extractor import ExtractionResult, GraphExtractor
 
 
 @dataclass
-class StatementFact:
-    statement_id: str
+class FactRecord:
+    source_id: str
     speaker: str
     round_index: Optional[int]
     text: str
+    source_kind: str
+    persons: Set[str] = field(default_factory=set)
     locations: Set[str] = field(default_factory=set)
     times: Set[str] = field(default_factory=set)
     objects: Set[str] = field(default_factory=set)
     confidence: float = 0.5
     event_id: Optional[str] = None
+    veracity: str = "claim"
 
 
 @dataclass
@@ -63,6 +66,31 @@ class MiragePlusRuntime:
         self.thresholds = self.mplus_config.get("thresholds", {})
         self.planner_config = self.mplus_config.get("planner", {})
         self.summary_config = self.mplus_config.get("summary", {})
+        extractor_config = self.mplus_config.get("extractor", {})
+        graph_config = self.mplus_config.get("graph", {}) or {}
+
+        default_nodes = [
+            "Person",
+            "Event",
+            "Object",
+            "Location",
+            "Time",
+            "Clue",
+            "Statement",
+        ]
+        default_edges = [
+            "was_at",
+            "used",
+            "involves",
+            "occurs_in",
+            "happens_at",
+            "refers_to",
+            "supports",
+            "contradicts",
+            "about",
+        ]
+        self.allowed_node_types: Set[str] = set(graph_config.get("node_types", default_nodes))
+        self.allowed_edge_types: Set[str] = set(graph_config.get("edge_types", default_edges))
 
         self.graph_path = self.log_dir / "graph_state.json"
         self.contradictions_path = self.log_dir / "contradictions.json"
@@ -73,7 +101,7 @@ class MiragePlusRuntime:
 
         self.nodes: Dict[str, GraphNode] = {}
         self.edges: Dict[str, GraphEdge] = {}
-        self.snapshots: List[Dict[str, Any]] = []
+        self.graph_state: Dict[str, Any] = {}
         self.contradictions: List[Dict[str, Any]] = []
         self.plan_log: Dict[int, Dict[str, Any]] = {}
         self.current_stage: Optional[str] = None
@@ -83,7 +111,7 @@ class MiragePlusRuntime:
         self.statement_history: List[Dict[str, Any]] = []
         self.round_message_buffer: List[str] = []
         self.victory_mrr: float = 0.0
-        self.statement_facts: List["StatementFact"] = []
+        self.fact_records: List["FactRecord"] = []
         self._conflict_counter: int = 0
         self._conflict_index: Set[frozenset[str]] = set()
 
@@ -98,14 +126,14 @@ class MiragePlusRuntime:
             "Time": 0
         }
 
-        self.extractor = GraphExtractor()
+        self.extractor = GraphExtractor(config=extractor_config)
         self._statement_event: Dict[str, str] = {}
         self.known_locations: Set[str] = set()
         self.known_objects: Set[str] = set()
         self.known_times: Set[str] = set()
 
         # Bootstrap log files so downstream consumers always find them.
-        self._ensure_file(self.graph_path, [])
+        self._ensure_file(self.graph_path, {})
         self._ensure_file(self.contradictions_path, self.contradictions)
         self._ensure_file(self.plan_path, [])
         self._ensure_file(self.votes_path, {})
@@ -145,6 +173,7 @@ class MiragePlusRuntime:
                 timestamp=datetime.utcnow().isoformat() + "Z",
                 source_agent=None,
                 source_round=None,
+                veracity="groundtruth",
             )
 
     def register_objects(self, objects: Iterable[str]) -> None:
@@ -154,6 +183,15 @@ class MiragePlusRuntime:
                 continue
             self.known_objects.add(obj)
             self.extractor.update_objects([obj])
+            self._ensure_object_node(
+                obj,
+                confidence=0.65,
+                provenance="bootstrap",
+                timestamp=datetime.utcnow().isoformat() + "Z",
+                source_agent=None,
+                source_round=None,
+                veracity="groundtruth",
+            )
 
     def bootstrap_from_clues(self, clues: Dict[str, Any]) -> None:
         locations: Set[str] = set()
@@ -180,6 +218,16 @@ class MiragePlusRuntime:
         self.register_locations(sorted(locations))
         self.register_objects(sorted(objects))
         self.known_times.update(times)
+        for time_value in sorted(times):
+            self._ensure_time_node(
+                time_value,
+                confidence=0.6,
+                provenance="bootstrap",
+                timestamp=datetime.utcnow().isoformat() + "Z",
+                source_agent=None,
+                source_round=None,
+                veracity="groundtruth",
+            )
 
     def bootstrap_from_scripts(self, scripts: Dict[str, Any]) -> None:
         locations: Set[str] = set()
@@ -198,6 +246,16 @@ class MiragePlusRuntime:
         self.register_locations(sorted(locations))
         self.register_objects(sorted(objects))
         self.known_times.update(times)
+        for time_value in sorted(times):
+            self._ensure_time_node(
+                time_value,
+                confidence=0.55,
+                provenance="bootstrap",
+                timestamp=datetime.utcnow().isoformat() + "Z",
+                source_agent=None,
+                source_round=None,
+                veracity="groundtruth",
+            )
 
     def record_message(
         self,
@@ -343,8 +401,6 @@ class MiragePlusRuntime:
         if self.plan_log:
             ordered_plans = [self.plan_log[k] for k in sorted(self.plan_log.keys())]
             self._write_json(self.plan_path, ordered_plans)
-        if self.snapshots:
-            self._write_json(self.graph_path, self.snapshots)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -370,13 +426,16 @@ class MiragePlusRuntime:
             "edges": [self._edge_to_dict(edge) for edge in self.edges.values()],
             "snapshot_id": f"G_r{round_index}"
         }
-        existing_rounds = [snap["round"] for snap in self.snapshots]
-        if round_index in existing_rounds:
-            idx = existing_rounds.index(round_index)
-            self.snapshots[idx] = snapshot
-        else:
-            self.snapshots.append(snapshot)
-        self._write_json(self.graph_path, self.snapshots)
+        self.graph_state = snapshot
+        self._write_json(self.graph_path, snapshot)
+
+    def _flush_graph(self, round_index: Optional[int]) -> None:
+        """Persist the current in-memory graph after incremental updates."""
+        if round_index is None:
+            round_index = self.current_round
+        if round_index is None:
+            round_index = 0
+        self._write_graph_snapshot(round_index)
 
     def _record_statement_node(
         self,
@@ -405,7 +464,8 @@ class MiragePlusRuntime:
             attributes={
                 "model": model,
                 "thought": thought,
-                "mp_extras": mp_extras or {}
+                "mp_extras": mp_extras or {},
+                "veracity": "claim",
             }
         )
         self.nodes[node.id] = node
@@ -426,6 +486,7 @@ class MiragePlusRuntime:
             provenance=provenance,
             text_span=response or text,
             last_updated=timestamp,
+            attributes=self._edge_style("statement"),
         )
         self._add_edge(edge)
 
@@ -440,10 +501,11 @@ class MiragePlusRuntime:
             mp_extras=mp_extras,
         )
         if extraction:
-            self._register_statement_fact(
-                statement=node,
+            self._register_fact(
+                source_node=node,
                 extraction=extraction,
                 event_id=event_id,
+                source_kind="statement",
                 mp_extras=mp_extras,
             )
             self._evaluate_conflicts(
@@ -451,6 +513,8 @@ class MiragePlusRuntime:
                 extraction=extraction,
                 timestamp=timestamp,
             )
+
+        self._flush_graph(round_index)
 
     def _record_clue_node(
         self,
@@ -471,9 +535,10 @@ class MiragePlusRuntime:
             provenance=provenance,
             text_span=text,
             last_updated=timestamp,
+            attributes={"veracity": "groundtruth"},
         )
         self.nodes[node.id] = node
-        self._process_extraction(
+        extraction, event_id = self._process_extraction(
             speaker=user,
             text=text,
             round_index=round_index,
@@ -483,6 +548,16 @@ class MiragePlusRuntime:
             source_kind="clue",
             mp_extras=None,
         )
+        if extraction:
+            self._register_fact(
+                source_node=node,
+                extraction=extraction,
+                event_id=event_id,
+                source_kind="clue",
+                mp_extras=None,
+            )
+
+        self._flush_graph(round_index)
 
     def _process_extraction(
         self,
@@ -503,6 +578,8 @@ class MiragePlusRuntime:
             return None, None
 
         event_id = None
+        style = self._edge_style(source_kind)
+        node_veracity = "groundtruth" if source_kind == "clue" else "claim"
         source_id = source_node.id if source_node else None
         if source_kind == "statement" and source_node is not None:
             event_id = self._ensure_event_for_statement(
@@ -516,7 +593,7 @@ class MiragePlusRuntime:
 
         for person in extraction.persons:
             target_id = self._person_node_id(person)
-            if source_id:
+            if source_id and source_kind == "statement":
                 self._add_edge(
                     GraphEdge(
                         id=self._next_edge_id("refers_to"),
@@ -529,6 +606,7 @@ class MiragePlusRuntime:
                         provenance=provenance,
                         text_span=text,
                         last_updated=timestamp,
+                        attributes=dict(style),
                     )
                 )
             if event_id:
@@ -544,6 +622,7 @@ class MiragePlusRuntime:
                         provenance=provenance,
                         text_span=text,
                         last_updated=timestamp,
+                        attributes=dict(style),
                     )
                 )
 
@@ -555,23 +634,8 @@ class MiragePlusRuntime:
                 timestamp=timestamp,
                 source_agent=speaker,
                 source_round=round_index,
+                veracity=node_veracity,
             )
-            if source_id:
-                relation = "refers_to" if source_kind == "statement" else "about"
-                self._add_edge(
-                    GraphEdge(
-                        id=self._next_edge_id(relation),
-                        type=relation,
-                        source=source_id,
-                        target=location_node.id,
-                        confidence=0.55,
-                        source_agent=speaker,
-                        source_round=round_index,
-                        provenance=provenance,
-                        text_span=text,
-                        last_updated=timestamp,
-                    )
-                )
             if event_id:
                 self._add_edge(
                     GraphEdge(
@@ -585,6 +649,7 @@ class MiragePlusRuntime:
                         provenance=provenance,
                         text_span=text,
                         last_updated=timestamp,
+                        attributes=dict(style),
                     )
                 )
             if source_kind == "statement" and location in extraction.claimed_locations and speaker in self.extractor.known_persons:
@@ -600,6 +665,7 @@ class MiragePlusRuntime:
                         provenance=provenance,
                         text_span=text,
                         last_updated=timestamp,
+                        attributes=dict(style),
                     )
                 )
 
@@ -611,13 +677,13 @@ class MiragePlusRuntime:
                 timestamp=timestamp,
                 source_agent=speaker,
                 source_round=round_index,
+                veracity=node_veracity,
             )
-            if source_id:
-                relation = "refers_to" if source_kind == "statement" else "about"
+            if source_id and source_kind == "statement":
                 self._add_edge(
                     GraphEdge(
-                        id=self._next_edge_id(relation),
-                        type=relation,
+                        id=self._next_edge_id("refers_to"),
+                        type="refers_to",
                         source=source_id,
                         target=object_node.id,
                         confidence=0.5,
@@ -626,6 +692,23 @@ class MiragePlusRuntime:
                         provenance=provenance,
                         text_span=text,
                         last_updated=timestamp,
+                        attributes={**style, "relation_origin": "refers_to"},
+                    )
+                )
+            if source_id and source_kind == "clue":
+                self._add_edge(
+                    GraphEdge(
+                        id=self._next_edge_id("about"),
+                        type="about",
+                        source=source_id,
+                        target=object_node.id,
+                        confidence=0.65,
+                        source_agent=speaker,
+                        source_round=round_index,
+                        provenance=provenance,
+                        text_span=text,
+                        last_updated=timestamp,
+                        attributes={**style, "relation_origin": "about"},
                     )
                 )
             if event_id:
@@ -641,6 +724,7 @@ class MiragePlusRuntime:
                         provenance=provenance,
                         text_span=text,
                         last_updated=timestamp,
+                        attributes=dict(style),
                     )
                 )
             if source_kind == "statement" and obj in extraction.used_objects and speaker in self.extractor.known_persons:
@@ -656,6 +740,7 @@ class MiragePlusRuntime:
                         provenance=provenance,
                         text_span=text,
                         last_updated=timestamp,
+                        attributes=dict(style),
                     )
                 )
 
@@ -667,22 +752,8 @@ class MiragePlusRuntime:
                 timestamp=timestamp,
                 source_agent=speaker,
                 source_round=round_index,
+                veracity=node_veracity,
             )
-            if source_kind == "statement" and source_node is not None:
-                self._add_edge(
-                    GraphEdge(
-                        id=self._next_edge_id("refers_to"),
-                        type="refers_to",
-                        source=source_node.id,
-                        target=time_node.id,
-                        confidence=0.5,
-                        source_agent=speaker,
-                        source_round=round_index,
-                        provenance=provenance,
-                        text_span=text,
-                        last_updated=timestamp,
-                    )
-                )
             if event_id:
                 self._add_edge(
                     GraphEdge(
@@ -696,6 +767,7 @@ class MiragePlusRuntime:
                         provenance=provenance,
                         text_span=text,
                         last_updated=timestamp,
+                        attributes=dict(style),
                     )
                 )
 
@@ -712,19 +784,41 @@ class MiragePlusRuntime:
         if statement_node.id in self._statement_event:
             return self._statement_event[statement_node.id]
         event_id = self._next_id("Event")
+        participants = set(extraction.persons)
+        if statement_node.source_agent:
+            participants.add(statement_node.source_agent)
+        times = sorted(extraction.times)
+        locations = sorted(extraction.locations)
+        objects = sorted(extraction.objects)
+        summary = extraction.summary or statement_node.text_span or statement_node.name
+        label_parts: List[str] = []
+        if participants:
+            label_parts.append("/".join(sorted(participants)))
+        if times:
+            label_parts.append("@" + "/".join(times))
+        if locations:
+            label_parts.append("在" + "/".join(locations))
+        if summary:
+            label_parts.append(self._truncate_text(summary, 80))
+        event_name = " ".join(part for part in label_parts if part) or f"Event {event_id}"
         event_node = GraphNode(
             id=event_id,
             type="Event",
-            name=f"event_{event_id}",
+            name=event_name,
             confidence=0.55,
             source_agent=statement_node.source_agent,
             source_round=round_index,
             provenance=provenance,
-            text_span=extraction.summary,
+            text_span=summary,
             last_updated=timestamp,
             attributes={
                 "source_statement": statement_node.id,
-                "summary": extraction.summary,
+                "summary": summary,
+                "participants": sorted(participants),
+                "times": times,
+                "locations": locations,
+                "objects": objects,
+                "veracity": "claim",
             },
         )
         self.nodes[event_node.id] = event_node
@@ -739,6 +833,22 @@ class MiragePlusRuntime:
         provenance: str,
         timestamp: str,
     ) -> None:
+        statement_node = self.nodes.get(statement_id)
+        if statement_node:
+            refers_edge = GraphEdge(
+                id=self._next_edge_id("refers_to"),
+                type="refers_to",
+                source=statement_id,
+                target=event_id,
+                confidence=statement_node.confidence,
+                source_agent=statement_node.source_agent,
+                source_round=statement_node.source_round,
+                provenance=provenance,
+                text_span=extraction.summary,
+                last_updated=timestamp,
+                attributes=self._edge_style("statement"),
+            )
+            self._add_edge(refers_edge)
         edge = GraphEdge(
             id=self._next_edge_id("supports"),
             type="supports",
@@ -750,44 +860,55 @@ class MiragePlusRuntime:
             provenance=provenance,
             text_span=extraction.summary,
             last_updated=timestamp,
-            attributes={"relation": "statement_reports_event"},
+            attributes={**self._edge_style("statement"), "relation": "statement_reports_event"},
         )
         self._add_edge(edge)
 
-    def _register_statement_fact(
+    def _register_fact(
         self,
         *,
-        statement: GraphNode,
+        source_node: GraphNode,
         extraction: ExtractionResult,
         event_id: Optional[str],
+        source_kind: str,
         mp_extras: Optional[Dict[str, Any]],
     ) -> None:
         locations = set(extraction.claimed_locations or extraction.locations)
         times = set(extraction.times)
         objects = set(extraction.objects)
-        confidence = statement.confidence
+        persons = set(extraction.persons)
+        if source_node.source_agent:
+            persons.add(source_node.source_agent)
+        confidence = source_node.confidence
         if mp_extras:
             extra_conf = mp_extras.get("confidence")
             if isinstance(extra_conf, (int, float)):
                 confidence = max(0.0, min(1.0, float(extra_conf)))
-        fact = StatementFact(
-            statement_id=statement.id,
-            speaker=statement.source_agent or statement.name,
-            round_index=statement.source_round,
-            text=statement.text_span or extraction.summary,
+        veracity = "groundtruth" if source_kind == "clue" else "claim"
+        fact = FactRecord(
+            source_id=source_node.id,
+            speaker=source_node.source_agent or source_node.name,
+            round_index=source_node.source_round,
+            text=source_node.text_span or extraction.summary,
+            source_kind=source_kind,
+            persons=persons,
             locations=locations,
             times=times,
             objects=objects,
             confidence=confidence,
             event_id=event_id,
+            veracity=veracity,
         )
-        self.statement_facts.append(fact)
-        for item in reversed(self.statement_history):
-            if item.get("statement_id") == statement.id:
-                item["locations"] = sorted(locations)
-                item["times"] = sorted(times)
-                item["objects"] = sorted(objects)
-                break
+        self.fact_records.append(fact)
+        if source_kind == "statement":
+            for item in reversed(self.statement_history):
+                if item.get("statement_id") == source_node.id:
+                    item["locations"] = sorted(locations)
+                    item["times"] = sorted(times)
+                    item["objects"] = sorted(objects)
+                    item["persons"] = sorted(persons)
+                    item["veracity"] = veracity
+                    break
 
     def _evaluate_conflicts(
         self,
@@ -796,13 +917,15 @@ class MiragePlusRuntime:
         extraction: ExtractionResult,
         timestamp: str,
     ) -> None:
-        fact = next((f for f in self.statement_facts if f.statement_id == statement.id), None)
+        fact = next((f for f in self.fact_records if f.source_id == statement.id and f.source_kind == "statement"), None)
         if fact is None:
             return
         if not fact.locations or not fact.times:
             return
-        for prior in self.statement_facts:
-            if prior.statement_id == fact.statement_id:
+        for prior in self.fact_records:
+            if prior.source_kind != "statement":
+                continue
+            if prior.source_id == fact.source_id:
                 continue
             if prior.speaker != fact.speaker:
                 continue
@@ -813,7 +936,7 @@ class MiragePlusRuntime:
                 continue
             if fact.locations & prior.locations:
                 continue
-            key = frozenset({fact.statement_id, prior.statement_id})
+            key = frozenset({fact.source_id, prior.source_id})
             if key in self._conflict_index:
                 continue
             severity = max(fact.confidence, prior.confidence)
@@ -825,12 +948,12 @@ class MiragePlusRuntime:
             )
             conflict = self._raise_conflict(
                 kind="TimeLocation",
-                statement_ids=[prior.statement_id, fact.statement_id],
+                statement_ids=[prior.source_id, fact.source_id],
                 speakers=[fact.speaker],
                 times=sorted(overlapping_times),
                 locations={
-                    prior.statement_id: sorted(prior.locations),
-                    fact.statement_id: sorted(fact.locations),
+                    prior.source_id: sorted(prior.locations),
+                    fact.source_id: sorted(fact.locations),
                 },
                 severity=severity,
                 description=description,
@@ -839,8 +962,8 @@ class MiragePlusRuntime:
             if conflict:
                 self._conflict_index.add(key)
                 self._add_contradiction_edges(
-                    prior.statement_id,
-                    fact.statement_id,
+                    prior.source_id,
+                    fact.source_id,
                     severity,
                     timestamp,
                 )
@@ -905,7 +1028,7 @@ class MiragePlusRuntime:
                 provenance="conflict_detection",
                 text_span=None,
                 last_updated=timestamp,
-                attributes={"reason": "time_location_conflict"},
+                attributes={**self._edge_style("inference"), "reason": "time_location_conflict"},
             )
             self._add_edge(edge)
 
@@ -918,12 +1041,18 @@ class MiragePlusRuntime:
         timestamp: str,
         source_agent: Optional[str],
         source_round: Optional[int],
+        veracity: str,
     ) -> GraphNode:
         node_id = self._location_node_id(name)
         if node_id in self.nodes:
             node = self.nodes[node_id]
             node.last_updated = timestamp
             node.confidence = max(node.confidence, confidence)
+            if node.attributes is None:
+                node.attributes = {}
+            existing = node.attributes.get("veracity")
+            if existing != "groundtruth" and veracity:
+                node.attributes["veracity"] = veracity
             return node
         node = GraphNode(
             id=node_id,
@@ -935,6 +1064,7 @@ class MiragePlusRuntime:
             provenance=provenance,
             text_span=None,
             last_updated=timestamp,
+            attributes={"veracity": veracity} if veracity else {},
         )
         self.nodes[node.id] = node
         self.known_locations.add(name)
@@ -950,12 +1080,18 @@ class MiragePlusRuntime:
         timestamp: str,
         source_agent: Optional[str],
         source_round: Optional[int],
+        veracity: str,
     ) -> GraphNode:
         node_id = self._object_node_id(name)
         if node_id in self.nodes:
             node = self.nodes[node_id]
             node.last_updated = timestamp
             node.confidence = max(node.confidence, confidence)
+            if node.attributes is None:
+                node.attributes = {}
+            existing = node.attributes.get("veracity")
+            if existing != "groundtruth" and veracity:
+                node.attributes["veracity"] = veracity
             return node
         node = GraphNode(
             id=node_id,
@@ -967,6 +1103,7 @@ class MiragePlusRuntime:
             provenance=provenance,
             text_span=None,
             last_updated=timestamp,
+            attributes={"veracity": veracity} if veracity else {},
         )
         self.nodes[node.id] = node
         self.known_objects.add(name)
@@ -982,12 +1119,18 @@ class MiragePlusRuntime:
         timestamp: str,
         source_agent: Optional[str],
         source_round: Optional[int],
+        veracity: str,
     ) -> GraphNode:
         node_id = self._time_node_id(value)
         if node_id in self.nodes:
             node = self.nodes[node_id]
             node.last_updated = timestamp
             node.confidence = max(node.confidence, confidence)
+            if node.attributes is None:
+                node.attributes = {}
+            existing = node.attributes.get("veracity")
+            if existing != "groundtruth" and veracity:
+                node.attributes["veracity"] = veracity
             return node
         node = GraphNode(
             id=node_id,
@@ -999,6 +1142,7 @@ class MiragePlusRuntime:
             provenance=provenance,
             text_span=None,
             last_updated=timestamp,
+            attributes={"veracity": veracity} if veracity else {},
         )
         self.nodes[node.id] = node
         self.known_times.add(value)
@@ -1006,6 +1150,11 @@ class MiragePlusRuntime:
     def _ensure_person_node(self, name: str) -> None:
         person_id = self._person_node_id(name)
         if person_id in self.nodes:
+            node = self.nodes[person_id]
+            if node.attributes is None:
+                node.attributes = {}
+            if node.attributes.get("veracity") != "groundtruth":
+                node.attributes["veracity"] = "groundtruth"
             return
         node = GraphNode(
             id=person_id,
@@ -1016,7 +1165,8 @@ class MiragePlusRuntime:
             source_round=0,
             provenance="role_card",
             text_span=None,
-            last_updated=datetime.utcnow().isoformat() + "Z"
+            last_updated=datetime.utcnow().isoformat() + "Z",
+            attributes={"veracity": "groundtruth"},
         )
         self.nodes[person_id] = node
 
@@ -1050,7 +1200,7 @@ class MiragePlusRuntime:
         return thought, response
 
     def _collect_recent_facts(self) -> List[str]:
-        window = self.statement_facts[-5:]
+        window = self.fact_records[-5:]
         facts: List[str] = []
         for fact in reversed(window):
             parts: List[str] = [fact.speaker or "Unknown"]
@@ -1063,7 +1213,13 @@ class MiragePlusRuntime:
             snippet = self._truncate_text(fact.text, 120)
             if snippet:
                 parts.append(snippet)
-            facts.append(" ".join(parts))
+            if fact.veracity == "groundtruth":
+                tag = "[solid]"
+            elif fact.veracity == "claim":
+                tag = "[claim]"
+            else:
+                tag = f"[{fact.veracity}]"
+            facts.append(f"{tag} " + " ".join(parts))
         return facts
 
     def _collect_event_chain(self) -> List[str]:
@@ -1114,6 +1270,13 @@ class MiragePlusRuntime:
         if template.startswith("prompt_"):
             return "statement"
         return "system"
+
+    def _edge_style(self, origin: str) -> Dict[str, str]:
+        if origin == "clue" or origin == "groundtruth":
+            return {"line_style": "solid", "veracity": "groundtruth"}
+        if origin == "inference":
+            return {"line_style": "solid", "veracity": "inference"}
+        return {"line_style": "dashed", "veracity": "claim"}
 
     def _update_plan_for_round(self, round_index: int) -> None:
         topk = int(self.planner_config.get("topk", 2) or 1)
@@ -1293,7 +1456,43 @@ class MiragePlusRuntime:
             data["attributes"] = edge.attributes
         return data
 
+    def _edge_allowed(self, edge: GraphEdge) -> bool:
+        if edge.type not in self.allowed_edge_types:
+            return False
+        source_node = self.nodes.get(edge.source)
+        target_node = self.nodes.get(edge.target)
+        if not source_node or not target_node:
+            return False
+        s_type = source_node.type
+        t_type = target_node.type
+        if edge.type == "was_at":
+            return s_type == "Person" and t_type == "Location"
+        if edge.type == "happens_at":
+            return s_type == "Event" and t_type == "Time"
+        if edge.type == "occurs_in":
+            return s_type == "Event" and t_type == "Location"
+        if edge.type == "involves":
+            return s_type == "Event" and t_type in {"Person", "Object"}
+        if edge.type == "used":
+            return s_type == "Person" and t_type == "Object"
+        if edge.type == "refers_to":
+            return s_type == "Statement" and t_type in {"Person", "Object", "Event", "Clue"}
+        if edge.type == "supports":
+            return s_type in {"Statement", "Clue"} and t_type in {"Event", "Statement"}
+        if edge.type == "contradicts":
+            return s_type == "Statement" and t_type == "Statement"
+        if edge.type == "about":
+            return s_type == "Clue" and t_type in {"Object", "Event"}
+        return False
+
     def _add_edge(self, edge: GraphEdge) -> GraphEdge:
+        if not self._edge_allowed(edge):
+            self._append_debug(
+                f"Skip edge {edge.type}: {edge.source}->{edge.target} (types: "
+                f"{self.nodes.get(edge.source).type if self.nodes.get(edge.source) else 'unknown'} -> "
+                f"{self.nodes.get(edge.target).type if self.nodes.get(edge.target) else 'unknown'})"
+            )
+            return edge
         key = (edge.type, edge.source, edge.target)
         existing_id = self._edge_index.get(key)
         if existing_id:
@@ -1304,7 +1503,20 @@ class MiragePlusRuntime:
             if edge.attributes:
                 if existing.attributes is None:
                     existing.attributes = {}
-                existing.attributes.update(edge.attributes)
+                for key, value in edge.attributes.items():
+                    if key == "line_style":
+                        current = existing.attributes.get(key)
+                        if current == "solid" and value != "solid":
+                            continue
+                        existing.attributes[key] = value
+                        continue
+                    if key == "veracity":
+                        current = existing.attributes.get(key)
+                        if current == "groundtruth" and value != "groundtruth":
+                            continue
+                        existing.attributes[key] = value
+                        continue
+                    existing.attributes[key] = value
             return existing
         self.edges[edge.id] = edge
         self._edge_index[key] = edge.id
@@ -1350,4 +1562,3 @@ class MiragePlusRuntime:
         if match:
             hour = int(match.group(1)) % 24
             return hour * 60
-        return math.inf

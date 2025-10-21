@@ -117,7 +117,15 @@ class Config:
         },
         "weights": {"O": 0.25, "M": 0.25, "V": 0.25, "C": 0.25},
         "planner": {"topk": 2, "max_questions_per_round": 2},
-        "summary": {"max_tokens": 256}
+        "summary": {"max_tokens": 256},
+        "extractor": {
+            "extra_location_keywords": [],
+            "extra_object_keywords": [],
+            "location_stopwords": [],
+            "object_stopwords": [],
+            "extra_location_patterns": [],
+            "extra_object_patterns": []
+        }
     }
 
 
