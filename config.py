@@ -86,6 +86,48 @@ class Config:
     if not os.path.exists(LogPath):
         os.makedirs(LogPath)
 
+    # MIRAGE+ configuration defaults
+    MPLUS = {
+        "extract_schema_version": "v1.2",
+        "graph": {
+            "node_types": [
+                "Person",
+                "Event",
+                "Object",
+                "Location",
+                "Time",
+                "Clue",
+                "Statement"
+            ],
+            "edge_types": [
+                "was_at",
+                "used",
+                "involves",
+                "occurs_in",
+                "happens_at",
+                "refers_to",
+                "supports",
+                "contradicts",
+                "about"
+            ]
+        },
+        "thresholds": {
+            "conflict_severity": 0.6,
+            "min_info_gain": 0.2
+        },
+        "weights": {"O": 0.25, "M": 0.25, "V": 0.25, "C": 0.25},
+        "planner": {"topk": 2, "max_questions_per_round": 2},
+        "summary": {"max_tokens": 256},
+        "extractor": {
+            "extra_location_keywords": [],
+            "extra_object_keywords": [],
+            "location_stopwords": [],
+            "object_stopwords": [],
+            "extra_location_patterns": [],
+            "extra_object_patterns": []
+        }
+    }
+
 
 for k, v in vars(args).items():
     setattr(Config, k, v)
